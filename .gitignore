@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+.virtualenv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated files
+outputs/*
+!outputs/.gitkeep
+screenshots/*
+!screenshots/.gitkeep
+runs/
+
+# Local videos and model weights
+videos/
+uploads/
+uploaded_videos/
+*.pt
+
+# Local credentials and temporary files
+*.pem
+*.key
+*.pfx
+*.p12
+*.tmp
+*.temp
+*.log
