@@ -9,7 +9,7 @@ The application uses the **official pretrained YOLO11n model** by default. It do
 - **Live Camera:** Start and stop webcam inference from Streamlit. Frames show person boxes, tracking IDs, confidence, current people, observed track IDs, directional crossings, and FPS. Stopping releases the camera.
 - **Upload Video:** Upload MP4, AVI, MOV, or MKV files, process them frame by frame with a progress indicator, preview the annotated result, and download it as MP4. The original upload is not modified.
 - Both modes share the same YOLO/ByteTrack and hysteresis-based counting logic. Statistics and tracker state reset for each new run.
-- Adjustable confidence, line height, and inference image size.
+- Adjustable confidence, horizontal or vertical counting-line orientation and position, and inference image size.
 - Existing CLI workflow remains available.
 - Processed previews, metrics, and download controls persist across Streamlit reruns; download does not rerun inference.
 
@@ -58,11 +58,11 @@ Streamlit opens the interface in a browser, usually at `http://localhost:8501`. 
 
 Detection defaults are confidence `0.10` and image size `960`. The low confidence cutoff is intentional: it allows ByteTrack's configured low-score matching stage (`track_low_thresh: 0.10`) to recover detections. Raising confidence above 0.10 filters those detections before ByteTrack sees them. Larger image sizes help with small/distant people but reduce CPU FPS; choose a lower size for speed.
 
-The line is horizontal, drawn in blue, and labeled with its pixel row and height percentage. **Live Camera** starts at 50% frame height; **Upload Video** starts at 62%, which intersects the people path in the local `people.mp4` sample. Adjust **Counting line height** until the line passes through the path that people actually cross; a line above or below all tracked centers will correctly report zero crossings. Downward and upward describe image movement; whether those mean enter or exit depends on camera placement. The hysteresis band is adaptive: the maximum of 0.5% frame height, 10% of the tracked box height, and 3 pixels.
+Choose **Horizontal** or **Vertical** with **Counting line orientation**. The line is drawn in blue; its position is measured from the top for horizontal lines and from the left for vertical lines. **Live Camera** starts at 50% and **Upload Video** at 62% of the corresponding frame dimension; 62% intersects the people path in the local `people.mp4` sample when horizontal. Place the line where people actually cross it. Direction labels reflect the orientation: upward/downward for horizontal lines and leftward/rightward for vertical lines. Whether those mean enter or exit depends on camera placement. The hysteresis band adapts to the relevant frame dimension and person box extent: the maximum of 0.5% of the frame dimension, 10% of the box extent, and 3 pixels.
 
-Enable **Show crossing debug details** to inspect each detected person's confidence, box, center, hysteresis width, previous stable side, current side (`above`, `deadband`, or `below`), and the last 50 counted crossing events. `--debug` in CLI mode logs the same detection/tracking details. Missing IDs are reported as untracked and are not assigned guessed crossings. A track keeps its side through gaps of up to 90 processed frames; after a longer interruption its next position initializes state without inventing a crossing.
+Enable **Show crossing debug details** to inspect each detected person's confidence, box, center, hysteresis width, previous stable side, current side (`above`/`below` or `left`/`right`, with `deadband`), and the last 50 counted crossing events. `--debug` in CLI mode logs the same detection/tracking details. Missing IDs are reported as untracked and are not assigned guessed crossings. A track keeps its side through gaps of up to 90 processed frames; after a longer interruption its next position initializes state without inventing a crossing.
 
-The dashboard's **Track IDs seen** is the number of different tracker IDs observed during the session, not the number of distinct real people. It can increase when pedestrians enter the scene or when a tracker ID is fragmented. The configured ByteTrack buffer is 90 frames to tolerate brief missed detections; increasing it too far can associate stale tracks to other people in crowded scenes.
+The dashboard's **Track IDs seen** is the number of different ByteTrack IDs observed during the session, not the number of distinct real people. The session keeps a set of IDs, so seeing the same ID in later frames does not increase the count. Tracker ID switches, occlusions, and lost tracks followed by reacquisition can create new IDs and inflate the total. ByteTrack IDs alone cannot guarantee distinct real-world identities. The configured ByteTrack buffer is 90 frames to tolerate brief missed detections; increasing it too far can associate stale tracks to other people in crowded scenes.
 
 ### Upload and process a video
 
@@ -72,9 +72,9 @@ The dashboard's **Track IDs seen** is the number of different tracker IDs observ
 4. Review the annotated preview and session statistics.
 5. Click **Download annotated video** to save the processed MP4.
 
-Processing uses a temporary input file that is deleted when processing completes. The annotated output is kept in a randomly named, per-session temporary directory so reruns and downloads can reuse it without storing the video bytes repeatedly in session state. The result directory is removed when a different upload replaces the current result or **Reset video results** is clicked. It does not write to or alter the selected original video.
+Processing uses a temporary input file that is deleted when processing completes. The annotated output is finalized as an H.264-encoded MP4 with FFmpeg, using the installed `imageio-ffmpeg` binary (or a system FFmpeg on `PATH`) and a browser-friendly quality setting. The finalized file is checked for a valid MP4 container and readable frames before preview or download. The app reports an error rather than saving a browser-incompatible preview if H.264 conversion is unavailable. The output is kept in a randomly named, per-session temporary directory so reruns and downloads can reuse it without storing the video bytes repeatedly in session state. The result directory is removed when a different upload replaces the current result or **Reset video results** is clicked. It does not write to or alter the selected original video.
 
-After processing, the annotated preview, saved metrics, and download control remain visible when Streamlit reruns. The Download button uses Streamlit's `on_click="ignore"` behavior, so downloading does not trigger another script run or inference pass. Changing confidence/resolution controls also does not process the video; click **Process video again** to explicitly start another run.
+After processing, the annotated preview, saved metrics, and download control remain visible when Streamlit reruns. The Download button uses Streamlit's `on_click="ignore"` behavior, so downloading does not trigger another script run or inference pass. Changing confidence, orientation, position, or resolution controls also does not process the video; click **Process video again** to explicitly start another run.
 
 ## Command-line interface
 
@@ -90,7 +90,7 @@ Video file:
 python main.py --source "videos\people.mp4" --save
 ```
 
-The CLI still supports `--model`, `--conf`, `--line-position`, `--imgsz`, `--save`, and `--output`. Defaults are `--conf 0.10` and `--imgsz 960`. Add `--debug` to log per-person confidence, ID, box, center, line side, and crossing event. Press **S** to save a screenshot, **Q** or **Esc** to quit.
+The CLI still supports `--model`, `--conf`, `--line-position`, `--line-orientation` (`horizontal` or `vertical`), `--imgsz`, `--save`, and `--output`. Defaults are horizontal orientation, `--conf 0.10`, and `--imgsz 960`. Add `--debug` to log per-person confidence, ID, box, center, line side, and crossing event. Press **S** to save a screenshot, **Q** or **Esc** to quit.
 
 ## Testing
 

@@ -151,8 +151,41 @@ class CrossingCounterTests(unittest.TestCase):
         crossing = counter.update(21, 1035, line_y, margin, 6)
         self.assertEqual(crossing["event"], "downward")
 
+    def test_counts_both_vertical_crossing_directions(self):
+        counter = CrossingCounter()
+
+        counter.update(
+            12, 40, 50, 5, 1, "left", "right", "leftward", "rightward"
+        )
+        rightward = counter.update(
+            12, 60, 50, 5, 2, "left", "right", "leftward", "rightward"
+        )
+        leftward = counter.update(
+            12, 40, 50, 5, 3, "left", "right", "leftward", "rightward"
+        )
+
+        self.assertEqual(rightward["event"], "rightward")
+        self.assertEqual(rightward["previous_side"], "left")
+        self.assertEqual(rightward["current_side"], "right")
+        self.assertEqual(leftward["event"], "leftward")
+
 
 class PeopleCounterTests(unittest.TestCase):
+    def test_track_ids_are_recorded_once_and_reset_for_a_new_session(self):
+        counter = PeopleCounter(model=None)
+
+        self.assertTrue(counter.record_track_id(17))
+        self.assertFalse(counter.record_track_id(17))
+        self.assertTrue(counter.record_track_id(23))
+        self.assertFalse(counter.record_track_id(None))
+        self.assertEqual(counter.summary()["unique_track_ids"], 2)
+
+        counter.reset()
+
+        self.assertEqual(counter.seen_ids, set())
+        self.assertTrue(counter.record_track_id(17))
+        self.assertEqual(counter.summary()["unique_track_ids"], 1)
+
     def test_constructor_accepts_all_application_options(self):
         counter = PeopleCounter(
             model=None,
@@ -160,6 +193,7 @@ class PeopleCounterTests(unittest.TestCase):
             line_position=0.62,
             imgsz=480,
             debug=True,
+            line_orientation="vertical",
         )
 
         self.assertIsNone(counter.model)
@@ -167,6 +201,7 @@ class PeopleCounterTests(unittest.TestCase):
         self.assertEqual(counter.line_position, 0.62)
         self.assertEqual(counter.imgsz, 480)
         self.assertTrue(counter.debug)
+        self.assertEqual(counter.line_orientation, "vertical")
 
     def test_process_frame_tracks_only_person_and_records_real_box_data(self):
         model = FakeModel()
@@ -184,6 +219,16 @@ class PeopleCounterTests(unittest.TestCase):
         self.assertEqual(counter.debug_observations[0]["center_y"], 40)
         self.assertEqual(counter.debug_observations[0]["hysteresis_px"], 4)
         self.assertEqual(annotated.shape, (100, 100, 3))
+
+    def test_vertical_line_uses_horizontal_center_coordinate_and_width(self):
+        counter = PeopleCounter(
+            model=FakeModel(), line_position=0.5, line_orientation="vertical"
+        )
+        annotated = counter.process_frame(np.zeros((300, 500, 3), dtype=np.uint8))
+
+        self.assertEqual(counter.debug_observations[0]["current_side"], "left")
+        self.assertEqual(counter.debug_observations[0]["hysteresis_px"], 3)
+        self.assertTrue(np.array_equal(annotated[250, 250], [255, 180, 0]))
 
     def test_reset_clears_session_metrics(self):
         counter = PeopleCounter(model=None)
@@ -208,6 +253,8 @@ class ArgumentTests(unittest.TestCase):
     def test_parses_webcam_and_video_sources(self):
         self.assertEqual(parse_source("0"), 0)
         self.assertEqual(parse_source("12"), 12)
+        self.assertEqual(parse_source(12), 12)
+        self.assertEqual(parse_source("  3  "), 3)
 
     def test_rejects_negative_camera_index(self):
         with self.assertRaisesRegex(ValueError, "zero or greater"):
@@ -218,11 +265,15 @@ class ArgumentTests(unittest.TestCase):
             parse_source(str(Path("missing-test-video.mp4")))
 
     def test_argument_defaults_and_custom_values(self):
-        args = parse_args(["--source", "2", "--conf", "0.1", "--line-position", "0.6"])
+        args = parse_args([
+            "--source", "2", "--conf", "0.1", "--line-position", "0.6",
+            "--line-orientation", "vertical",
+        ])
 
         self.assertEqual(args.source, "2")
         self.assertEqual(args.conf, 0.1)
         self.assertEqual(args.line_position, 0.6)
+        self.assertEqual(args.line_orientation, "vertical")
         self.assertEqual(args.imgsz, 960)
 
     def test_detection_defaults_allow_bytetrack_low_score_association(self):
@@ -230,6 +281,7 @@ class ArgumentTests(unittest.TestCase):
 
         self.assertEqual(args.conf, 0.10)
         self.assertEqual(args.imgsz, 960)
+        self.assertEqual(args.line_orientation, "horizontal")
         self.assertFalse(args.save)
 
 

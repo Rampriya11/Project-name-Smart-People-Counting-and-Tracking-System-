@@ -20,22 +20,27 @@ TRACKER_CONFIG = Path(__file__).with_name("bytetrack_people.yaml")
 
 
 class CrossingCounter:
-    """Count tracked center points crossing a horizontal line with a deadband."""
+    """Count tracked center points crossing a line with a deadband."""
 
     def __init__(self, max_missing_frames=90):
         self.max_missing_frames = max_missing_frames
         self._tracks = {}
 
     @staticmethod
-    def classify(center_y, line_y, hysteresis):
-        if center_y < line_y - hysteresis:
-            return "above"
-        if center_y > line_y + hysteresis:
-            return "below"
+    def classify(coordinate, line_coordinate, hysteresis, negative_side="above",
+                 positive_side="below"):
+        if coordinate < line_coordinate - hysteresis:
+            return negative_side
+        if coordinate > line_coordinate + hysteresis:
+            return positive_side
         return "deadband"
 
-    def update(self, track_id, center_y, line_y, hysteresis, frame_index):
-        current_side = self.classify(center_y, line_y, hysteresis)
+    def update(self, track_id, coordinate, line_coordinate, hysteresis, frame_index,
+               negative_side="above", positive_side="below",
+               negative_event="upward", positive_event="downward"):
+        current_side = self.classify(
+            coordinate, line_coordinate, hysteresis, negative_side, positive_side
+        )
         track = self._tracks.get(track_id)
         previous_side = None if track is None else track["stable_side"]
         if track is not None and frame_index - track["last_frame"] > self.max_missing_frames:
@@ -43,10 +48,10 @@ class CrossingCounter:
 
         event = None
         if current_side != "deadband":
-            if previous_side == "above" and current_side == "below":
-                event = "downward"
-            elif previous_side == "below" and current_side == "above":
-                event = "upward"
+            if previous_side == negative_side and current_side == positive_side:
+                event = positive_event
+            elif previous_side == positive_side and current_side == negative_side:
+                event = negative_event
             stable_side = current_side
         else:
             stable_side = previous_side
@@ -67,12 +72,16 @@ class CrossingCounter:
 class PeopleCounter:
     """Per-session metrics and frame annotation backed by an Ultralytics model."""
 
-    def __init__(self, model, conf=0.10, line_position=0.5, imgsz=960, debug=False):
+    def __init__(self, model, conf=0.10, line_position=0.5, imgsz=960, debug=False,
+                 line_orientation="horizontal"):
+        if line_orientation not in ("horizontal", "vertical"):
+            raise ValueError("Line orientation must be horizontal or vertical.")
         self.model = model
         self.conf = conf
         self.line_position = line_position
         self.imgsz = imgsz
         self.debug = debug
+        self.line_orientation = line_orientation
         self.reset()
 
     @staticmethod
@@ -82,6 +91,12 @@ class PeopleCounter:
             int(frame_height * 0.005),
             int(person_height * 0.10),
         )
+
+    def record_track_id(self, track_id):
+        if track_id is None or track_id in self.seen_ids:
+            return False
+        self.seen_ids.add(track_id)
+        return True
 
     def reset(self):
         self.seen_ids = set()
@@ -105,7 +120,14 @@ class PeopleCounter:
     def process_frame(self, frame):
         self.frame_index += 1
         height, width = frame.shape[:2]
-        line_y = int(height * self.line_position)
+        vertical = self.line_orientation == "vertical"
+        line_coordinate = int((width if vertical else height) * self.line_position)
+        negative_side, positive_side = (
+            ("left", "right") if vertical else ("above", "below")
+        )
+        negative_event, positive_event = (
+            ("leftward", "rightward") if vertical else ("upward", "downward")
+        )
         results = self.model.track(
             frame,
             persist=True,
@@ -139,23 +161,39 @@ class PeopleCounter:
                 x1, y1, x2, y2 = map(int, box)
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
-                hysteresis = self.crossing_hysteresis(height, y2 - y1)
+                coordinate = center_x if vertical else center_y
+                person_extent = x2 - x1 if vertical else y2 - y1
+                hysteresis = self.crossing_hysteresis(
+                    width if vertical else height, person_extent
+                )
                 self.current_people += 1
                 if track_id is not None:
-                    self.seen_ids.add(track_id)
+                    self.record_track_id(track_id)
                     observation = self.crossing_counter.update(
-                        track_id, center_y, line_y, hysteresis, self.frame_index
+                        track_id,
+                        coordinate,
+                        line_coordinate,
+                        hysteresis,
+                        self.frame_index,
+                        negative_side,
+                        positive_side,
+                        negative_event,
+                        positive_event,
                     )
-                    if observation["event"] == "downward":
+                    if observation["event"] == positive_event:
                         self.downward_count += 1
-                    elif observation["event"] == "upward":
+                    elif observation["event"] == negative_event:
                         self.upward_count += 1
                 else:
                     observation = {
                         "track_id": "missing",
                         "previous_side": "unknown",
                         "current_side": CrossingCounter.classify(
-                            center_y, line_y, hysteresis
+                            coordinate,
+                            line_coordinate,
+                            hysteresis,
+                            negative_side,
+                            positive_side,
                         ),
                         "stable_side": "unknown",
                         "event": "untracked",
@@ -167,7 +205,7 @@ class PeopleCounter:
                 observation["bbox"] = (x1, y1, x2, y2)
                 observation["hysteresis_px"] = hysteresis
                 self.debug_observations.append(observation)
-                if observation["event"] in ("downward", "upward"):
+                if observation["event"] in (negative_event, positive_event):
                     self.debug_events.append({
                         **observation,
                         "frame_index": self.frame_index,
@@ -212,12 +250,25 @@ class PeopleCounter:
                 )
                 cv2.circle(annotated, (center_x, center_y), 4, (0, 0, 255), -1)
 
-        cv2.line(annotated, (0, line_y), (width, line_y), (255, 180, 0), 2)
-        cv2.putText(
-            annotated, "COUNTING LINE", (10, max(22, line_y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 0), 2,
-            cv2.LINE_AA,
-        )
+        if vertical:
+            cv2.line(
+                annotated, (line_coordinate, 0), (line_coordinate, height),
+                (255, 180, 0), 2,
+            )
+            cv2.putText(
+                annotated, "COUNTING LINE",
+                (max(0, min(width - 150, line_coordinate + 10)), 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 0), 2,
+                cv2.LINE_AA,
+            )
+        else:
+            cv2.line(annotated, (0, line_coordinate), (width, line_coordinate),
+                     (255, 180, 0), 2)
+            cv2.putText(
+                annotated, "COUNTING LINE", (10, max(22, line_coordinate - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 180, 0), 2,
+                cv2.LINE_AA,
+            )
 
         now = time.perf_counter()
         instant_fps = (
@@ -232,13 +283,19 @@ class PeopleCounter:
 
         overlay = annotated.copy()
         cv2.rectangle(overlay, (8, 8), (380, 188), (20, 20, 20), -1)
+        negative_direction, positive_direction = (
+            ("Leftward", "Rightward")
+            if vertical
+            else ("Upward", "Downward")
+        )
         dashboard = [
             f"Current people: {self.current_people}",
             f"Track IDs observed: {len(self.seen_ids)}",
-            f"Downward crossings: {self.downward_count}",
-            f"Upward crossings: {self.upward_count}",
+            f"{positive_direction} crossings: {self.downward_count}",
+            f"{negative_direction} crossings: {self.upward_count}",
             f"FPS: {self.smoothed_fps:.1f}",
-            f"Line: y={line_y}px ({self.line_position:.0%})",
+            f"Line: {'x' if vertical else 'y'}={line_coordinate}px "
+            f"({self.line_position:.0%})",
         ]
         annotated = cv2.addWeighted(overlay, 0.72, annotated, 0.28, 0)
         for index, text in enumerate(dashboard):
@@ -280,7 +337,11 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--line-position", type=float, default=0.50,
-        help="Horizontal counting-line position as a frame-height fraction (0 to 1).",
+        help="Counting-line position as a frame-width/height fraction (0 to 1).",
+    )
+    parser.add_argument(
+        "--line-orientation", choices=("horizontal", "vertical"), default="horizontal",
+        help="Counting-line orientation.",
     )
     parser.add_argument("--save", action="store_true", help="Save annotated output video.")
     parser.add_argument(
@@ -307,11 +368,14 @@ def parse_args(argv=None):
 
 
 def parse_source(source):
-    if source.isdecimal():
-        return int(source)
-    if source.lstrip("-").isdecimal():
+    source_text = str(source).strip()
+    if not source_text:
+        raise ValueError("Source cannot be empty.")
+    if source_text.isdecimal():
+        return int(source_text)
+    if source_text.lstrip("-").isdecimal():
         raise ValueError("Webcam index must be zero or greater.")
-    video_path = Path(source)
+    video_path = Path(source_text)
     if not video_path.is_file():
         raise FileNotFoundError(f"Video file does not exist: {video_path}")
     return str(video_path)
@@ -379,6 +443,7 @@ def main(argv=None):
             line_position=args.line_position,
             imgsz=args.imgsz,
             debug=args.debug,
+            line_orientation=args.line_orientation,
         )
         print("Smart People Counting System started.")
         print("Press Q or Esc to quit; press S to save a screenshot.")
@@ -429,8 +494,13 @@ def main(argv=None):
     print("\nSession summary")
     print(f"Frames processed: {frame_count}")
     print(f"Track IDs observed: {summary['unique_track_ids']}")
-    print(f"Downward crossings: {summary['downward_crossings']}")
-    print(f"Upward crossings: {summary['upward_crossings']}")
+    negative_direction, positive_direction = (
+        ("Leftward", "Rightward")
+        if args.line_orientation == "vertical"
+        else ("Upward", "Downward")
+    )
+    print(f"{positive_direction} crossings: {summary['downward_crossings']}")
+    print(f"{negative_direction} crossings: {summary['upward_crossings']}")
     if args.save:
         print(f"Annotated video saved to: {output_path}")
 

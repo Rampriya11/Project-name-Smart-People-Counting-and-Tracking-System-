@@ -1,3 +1,4 @@
+import shutil
 import unittest
 import uuid
 from pathlib import Path
@@ -13,6 +14,9 @@ from app import (
     activate_upload,
     clear_video_result,
     process_uploaded_video,
+    process_uploaded_video_to_file,
+    _validate_annotated_video,
+    _validate_video_preview_source,
 )
 from streamlit.testing.v1 import AppTest
 
@@ -33,7 +37,42 @@ class UploadedFile:
         return len(self._payload)
 
 
+class UploadLike:
+    def __init__(self, name, payload=b""):
+        self.name = name
+        self._payload = payload
+
+    def getvalue(self):
+        return self._payload
+
+    @property
+    def size(self):
+        return len(self._payload)
+
+
+class FrameCounter:
+    def reset(self):
+        self.frames = 0
+
+    def process_frame(self, frame):
+        self.frames += 1
+        return frame
+
+    def summary(self):
+        return {
+            "current_people": 0,
+            "unique_track_ids": 0,
+            "downward_crossings": 0,
+            "upward_crossings": 0,
+            "fps": 0.0,
+        }
+
+
 class UploadValidationTests(unittest.TestCase):
+    def test_upload_identity_works_without_getbuffer(self):
+        upload = UploadLike("clip.mp4", b"video-data")
+        self.assertTrue(activate_upload({"active_upload_id": None}, upload))
+
     def test_rejects_unsupported_extension_before_creating_files(self):
         with self.assertRaisesRegex(ValueError, "MP4, AVI, MOV, or MKV"):
             process_uploaded_video(UploadedFile("clip.wmv"), counter=None)
@@ -51,6 +90,56 @@ class UploadValidationTests(unittest.TestCase):
                     )
 
             self.assertEqual(list(Path(folder).iterdir()), [])
+
+    def test_processed_output_is_h264_mp4_with_readable_frames(self):
+        with TemporaryDirectory() as folder:
+            input_path = Path(folder) / "input.mp4"
+            writer = cv2.VideoWriter(
+                str(input_path),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                8.0,
+                (64, 48),
+            )
+            self.assertTrue(writer.isOpened())
+            for frame_index in range(5):
+                writer.write(np.full((48, 64, 3), frame_index * 20, dtype=np.uint8))
+            writer.release()
+            upload_payload = input_path.read_bytes()
+            output_path = Path(folder) / "annotated.mp4"
+
+            try:
+                frames, summary = process_uploaded_video_to_file(
+                    UploadedFile("source.mp4", upload_payload),
+                    FrameCounter(),
+                    output_path,
+                )
+            except RuntimeError as exc:
+                if (
+                    "OpenCV's H.264 encoder is unavailable" in str(exc)
+                    and not shutil.which("ffmpeg")
+                ):
+                    self.skipTest("H.264 encoder and FFmpeg are unavailable.")
+                raise
+
+            self.assertEqual(frames, 5)
+            self.assertEqual(summary["current_people"], 0)
+            self.assertEqual(input_path.read_bytes(), upload_payload)
+            codec, decoded_frames = _validate_annotated_video(output_path, frames)
+            self.assertIn(codec.lower(), ("h264", "avc1"))
+            self.assertEqual(decoded_frames, frames)
+            self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_output_validation_rejects_empty_and_wrong_extension(self):
+        with TemporaryDirectory() as folder:
+            empty_mp4 = Path(folder) / "empty.mp4"
+            empty_mp4.touch()
+            with self.assertRaisesRegex(RuntimeError, "missing or empty"):
+                _validate_annotated_video(empty_mp4, 1)
+
+            wrong_extension = Path(folder) / "output.avi"
+            wrong_extension.write_bytes(b"video")
+            with self.assertRaisesRegex(ValueError, "\\.mp4"):
+                _validate_annotated_video(wrong_extension, 1)
 
     def test_new_upload_clears_previous_result_artifact(self):
         with TemporaryDirectory() as folder:
@@ -132,13 +221,19 @@ class UploadValidationTests(unittest.TestCase):
             video_path = result_directory / "annotated.mp4"
             writer = cv2.VideoWriter(
                 str(video_path),
-                cv2.VideoWriter_fourcc(*"mp4v"),
+                cv2.VideoWriter_fourcc(*"avc1"),
                 5.0,
                 (64, 48),
             )
             self.assertTrue(writer.isOpened())
             writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
             writer.release()
+            try:
+                _validate_video_preview_source(video_path)
+            except RuntimeError as exc:
+                if "H.264" in str(exc) or "h264" in str(exc).lower():
+                    self.skipTest("H.264 encoder is unavailable.")
+                raise
             upload_id = "test-upload"
             app = AppTest.from_file(str(Path(__file__).with_name("app.py")))
             app.session_state["detection_mode"] = "Upload Video"
@@ -156,6 +251,7 @@ class UploadValidationTests(unittest.TestCase):
             app.session_state["video_result_frames"] = 42
             app.session_state["video_result_name"] = "sample.mp4"
             app.session_state["video_result_upload_id"] = upload_id
+            app.session_state["video_result_track_ids"] = set(range(9))
             app.session_state["video_status"] = "complete"
             app.session_state["video_error"] = None
             app.session_state["video_debug_observations"] = None
@@ -166,23 +262,34 @@ class UploadValidationTests(unittest.TestCase):
             ))):
                 app.run()
                 self.assertFalse(app.exception)
+                self.assertEqual(
+                    app.sidebar.selectbox[0].options, ["Horizontal", "Vertical"]
+                )
                 self.assertEqual(len(app.get("video")), 1)
                 self.assertEqual(len(app.metric), 5)
                 self.assertEqual([metric.value for metric in app.metric], [
                     "4", "9", "2", "1", "12.5",
                 ])
+                self.assertEqual(app.session_state["video_result_track_ids"], set(range(9)))
                 self.assertEqual(len(app.get("download_button")), 1)
 
                 app.sidebar.slider[0].set_value(0.20).run()
                 self.assertFalse(app.exception)
                 self.assertEqual(len(app.get("video")), 1)
                 self.assertEqual(len(app.metric), 5)
+                self.assertEqual(app.session_state["video_result_track_ids"], set(range(9)))
                 self.assertEqual(len(app.get("download_button")), 1)
+
+                app.sidebar.selectbox[0].set_value("Vertical").run()
+                self.assertFalse(app.exception)
+                self.assertIn("Upward Crossings", [metric.label for metric in app.metric])
+                self.assertIn("Downward Crossings", [metric.label for metric in app.metric])
 
                 app.get("download_button")[0].click().run()
 
                 self.assertFalse(app.exception)
                 self.assertTrue(video_path.is_file())
+                self.assertEqual(app.session_state["video_result_track_ids"], set(range(9)))
                 self.assertEqual(len(app.get("video")), 1)
                 self.assertEqual(len(app.metric), 5)
                 self.assertEqual(len(app.get("download_button")), 1)

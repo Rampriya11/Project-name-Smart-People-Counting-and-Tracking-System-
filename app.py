@@ -2,15 +2,17 @@
 
 import hashlib
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
 import streamlit as st
 from ultralytics import YOLO
 
-from main import LOGGER, PeopleCounter, create_output_writer
+from main import CrossingCounter, LOGGER, PeopleCounter, create_output_writer
 
 
 SUPPORTED_VIDEO_TYPES = ("mp4", "avi", "mov", "mkv")
@@ -20,6 +22,8 @@ VIDEO_STATE_KEYS = (
     "video_result_frames",
     "video_result_name",
     "video_result_upload_id",
+    "video_result_orientation",
+    "video_result_track_ids",
     "video_debug_observations",
     "video_debug_events",
 )
@@ -28,11 +32,17 @@ VIDEO_STATE_KEYS = (
 def _upload_identity(uploaded_file):
     file_id = getattr(uploaded_file, "file_id", None)
     size = getattr(uploaded_file, "size", None)
+    name = getattr(uploaded_file, "name", None) or getattr(uploaded_file, "filename", "")
     if file_id is None:
-        payload = uploaded_file.getbuffer()
+        try:
+            payload = uploaded_file.getbuffer()
+        except AttributeError:
+            payload = uploaded_file.getvalue()
         file_id = hashlib.sha256(payload).hexdigest()
         size = len(payload)
-    identity = f"{file_id}:{uploaded_file.name}:{size}"
+    if size is None:
+        size = 0
+    identity = f"{file_id}:{name}:{size}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -104,12 +114,21 @@ def _initialize_session_state():
             st.session_state[key] = None
 
 
-def _render_metrics(metrics):
+def _render_metrics(metrics, line_orientation="horizontal"):
     columns = st.columns(5)
     columns[0].metric("Current People", metrics["current_people"])
     columns[1].metric("Unique Track IDs", metrics["unique_track_ids"])
-    columns[2].metric("Downward Crossings", metrics["downward_crossings"])
-    columns[3].metric("Upward Crossings", metrics["upward_crossings"])
+    negative_direction, positive_direction = (
+        ("Leftward", "Rightward")
+        if line_orientation == "vertical"
+        else ("Upward", "Downward")
+    )
+    columns[2].metric(
+        f"{positive_direction} Crossings", metrics["downward_crossings"]
+    )
+    columns[3].metric(
+        f"{negative_direction} Crossings", metrics["upward_crossings"]
+    )
     columns[4].metric("FPS", f"{metrics['fps']:.1f}")
 
 
@@ -130,19 +149,37 @@ def _render_video_result():
         f"{st.session_state.video_result_name} · "
         f"{st.session_state.video_result_frames:,} frames processed"
     )
-    st.video(str(result_path))
-    _render_metrics(st.session_state.video_result_metrics)
     try:
-        st.download_button(
-            "Download annotated video",
-            data=result_path.read_bytes(),
-            file_name=f"{Path(st.session_state.video_result_name).stem}_annotated.mp4",
-            mime="video/mp4",
-            key=f"download_video_{st.session_state.video_result_upload_id}",
-            on_click="ignore",
-            type="primary",
-            use_container_width=True,
-        )
+        _validate_video_preview_source(result_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        LOGGER.warning("Saved annotated video is not previewable: %s", exc)
+        st.error(f"The saved annotated video cannot be previewed: {exc}")
+    else:
+        st.video(str(result_path), format="video/mp4")
+    result_metrics = dict(st.session_state.video_result_metrics)
+    track_ids = st.session_state.video_result_track_ids
+    if track_ids is not None:
+        result_metrics["unique_track_ids"] = len(track_ids)
+    _render_metrics(
+        result_metrics,
+        st.session_state.video_result_orientation or "horizontal",
+    )
+    st.caption(
+        "Track IDs are tracker labels, not guaranteed distinct people. "
+        "ID switches, occlusions, and lost tracks can increase this count."
+    )
+    try:
+        with result_path.open("rb") as video_file:
+            st.download_button(
+                "Download annotated video",
+                data=video_file,
+                file_name=f"{Path(st.session_state.video_result_name).stem}_annotated.mp4",
+                mime="video/mp4",
+                key=f"download_video_{st.session_state.video_result_upload_id}",
+                on_click="ignore",
+                type="primary",
+                use_container_width=True,
+            )
     except OSError as exc:
         LOGGER.exception("Could not read saved video for download")
         st.error(f"Could not prepare the annotated video download: {exc}")
@@ -180,6 +217,134 @@ def _temporary_path(suffix):
     return path
 
 
+def _create_browser_video_writer(output_path, fps, frame_size):
+    output_path = Path(output_path)
+    intermediate_path = output_path.with_name(
+        f"{output_path.stem}_intermediate.mp4"
+    )
+    try:
+        writer = create_output_writer(intermediate_path, fps, frame_size)
+    except (OSError, RuntimeError, cv2.error) as exc:
+        intermediate_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Could not create an intermediate video for H.264 conversion. "
+            f"Details: {exc}"
+        ) from exc
+    return writer, intermediate_path
+
+
+def _ffmpeg_executable():
+    return shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _convert_video_to_h264(ffmpeg, input_path, output_path):
+    result = subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-i",
+            str(input_path),
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        details = result.stderr.strip().splitlines()
+        message = details[-1] if details else "FFmpeg returned an error."
+        raise RuntimeError(f"Could not convert the annotated video to H.264: {message}")
+
+
+def _validate_annotated_video(output_path, expected_frames):
+    output_path = Path(output_path)
+    if output_path.suffix.lower() != ".mp4":
+        raise ValueError("The annotated output must use the .mp4 extension.")
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError("The annotated MP4 output is missing or empty.")
+    with output_path.open("rb") as output_file:
+        if b"ftyp" not in output_file.read(32):
+            raise RuntimeError("The annotated output does not contain an MP4 container.")
+
+    capture = cv2.VideoCapture(str(output_path))
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError("OpenCV could not open the finalized annotated MP4.")
+
+    fourcc_value = int(capture.get(cv2.CAP_PROP_FOURCC))
+    codec = "".join(chr((fourcc_value >> (8 * index)) & 0xFF) for index in range(4))
+    decoded_frames = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            if frame is None or frame.size == 0:
+                raise RuntimeError("The annotated MP4 contains an unreadable frame.")
+            decoded_frames += 1
+    finally:
+        capture.release()
+
+    if codec.lower() not in ("h264", "avc1"):
+        raise RuntimeError(
+            f"The annotated MP4 uses unsupported codec '{codec or 'unknown'}'; "
+            "a browser-compatible H.264 video is required."
+        )
+    if decoded_frames == 0:
+        raise RuntimeError("OpenCV could not decode any frames from the annotated MP4.")
+    if decoded_frames != expected_frames:
+        raise RuntimeError(
+            "The finalized annotated MP4 is incomplete: "
+            f"expected {expected_frames} readable frames, got {decoded_frames}."
+        )
+    return codec, decoded_frames
+
+
+def _validate_video_preview_source(video_path):
+    video_path = Path(video_path)
+    if video_path.suffix.lower() != ".mp4":
+        raise ValueError("The saved preview must be an MP4 file.")
+    if not video_path.is_file() or video_path.stat().st_size == 0:
+        raise RuntimeError("The saved MP4 is missing or empty.")
+    with video_path.open("rb") as video_file:
+        if b"ftyp" not in video_file.read(32):
+            raise RuntimeError("The saved preview does not contain an MP4 container.")
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        capture.release()
+        raise RuntimeError("OpenCV could not open the saved MP4.")
+    try:
+        fourcc_value = int(capture.get(cv2.CAP_PROP_FOURCC))
+        codec = "".join(
+            chr((fourcc_value >> (8 * index)) & 0xFF) for index in range(4)
+        )
+        ok, frame = capture.read()
+    finally:
+        capture.release()
+
+    if codec.lower() not in ("h264", "avc1"):
+        raise RuntimeError(
+            f"The saved MP4 uses unsupported codec '{codec or 'unknown'}'. "
+            "Process the upload again to create a browser-compatible H.264 preview."
+        )
+    if not ok or frame is None or frame.size == 0:
+        raise RuntimeError("OpenCV could not decode a frame from the saved MP4.")
+
+
 def process_uploaded_video_to_file(
     uploaded_file,
     counter,
@@ -195,6 +360,7 @@ def process_uploaded_video_to_file(
     output_path = Path(output_path)
     cap = None
     writer = None
+    intermediate_path = None
     frame_count = 0
 
     try:
@@ -219,7 +385,7 @@ def process_uploaded_video_to_file(
                 break
             annotated = counter.process_frame(frame)
             if writer is None:
-                writer = create_output_writer(
+                writer, intermediate_path = _create_browser_video_writer(
                     output_path, source_fps, (frame.shape[1], frame.shape[0])
                 )
             writer.write(annotated)
@@ -237,8 +403,17 @@ def process_uploaded_video_to_file(
         cap = None
         writer.release()
         writer = None
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise RuntimeError("The annotated output video is empty.")
+        if intermediate_path is not None:
+            ffmpeg = _ffmpeg_executable()
+            _convert_video_to_h264(ffmpeg, intermediate_path, output_path)
+        codec, decoded_frames = _validate_annotated_video(output_path, frame_count)
+        LOGGER.info(
+            "Finalized annotated output %s: codec=%s, container=MP4, "
+            "mime=video/mp4, frames=%d",
+            output_path,
+            codec,
+            decoded_frames,
+        )
         return frame_count, counter.summary()
     except Exception:
         output_path.unlink(missing_ok=True)
@@ -248,6 +423,8 @@ def process_uploaded_video_to_file(
             cap.release()
         if writer is not None:
             writer.release()
+        if intermediate_path is not None:
+            intermediate_path.unlink(missing_ok=True)
         if input_path is not None:
             input_path.unlink(missing_ok=True)
 
@@ -305,10 +482,23 @@ def _render_live_frame():
     metrics = st.session_state.live_counter.summary()
     columns = st.columns(5)
     columns[0].metric("Current people", metrics["current_people"])
-    columns[1].metric("Track IDs seen", metrics["unique_track_ids"])
-    columns[2].metric("Downward", metrics["downward_crossings"])
-    columns[3].metric("Upward", metrics["upward_crossings"])
+    columns[1].metric("Unique Track IDs", metrics["unique_track_ids"])
+    negative_direction, positive_direction = (
+        ("Leftward", "Rightward")
+        if st.session_state.live_counter.line_orientation == "vertical"
+        else ("Upward", "Downward")
+    )
+    columns[2].metric(
+        positive_direction, metrics["downward_crossings"]
+    )
+    columns[3].metric(
+        negative_direction, metrics["upward_crossings"]
+    )
     columns[4].metric("FPS", f"{metrics['fps']:.1f}")
+    st.caption(
+        "Track IDs are not guaranteed distinct people; ID switches, occlusions, "
+        "and lost tracks can increase this count."
+    )
     if st.session_state.live_counter.debug:
         with st.expander("Crossing debug details"):
             st.caption("Latest tracked centers and their stable-side transitions.")
@@ -362,6 +552,15 @@ def main():
         0.01,
         key=f"line_position_{mode.lower().replace(' ', '_')}",
     )
+    line_orientation = st.sidebar.selectbox(
+        "Counting line orientation",
+        ("Horizontal", "Vertical"),
+        key="line_orientation",
+    ).lower()
+    st.sidebar.caption(
+        "Line position is measured from the top for horizontal lines "
+        "and from the left for vertical lines."
+    )
     image_size = st.sidebar.select_slider(
         "Inference resolution",
         options=(320, 480, 640, 800, 960, 1280),
@@ -375,10 +574,15 @@ def main():
         st.subheader("Live camera")
         st.caption("Analyze the camera connected to the computer running this app.")
         if st.session_state.live_running and st.session_state.live_counter is not None:
+            if st.session_state.live_counter.line_orientation != line_orientation:
+                st.session_state.live_counter.crossing_counter = CrossingCounter()
+                st.session_state.live_counter.downward_count = 0
+                st.session_state.live_counter.upward_count = 0
             st.session_state.live_counter.conf = confidence
             st.session_state.live_counter.line_position = line_position
             st.session_state.live_counter.imgsz = image_size
             st.session_state.live_counter.debug = debug
+            st.session_state.live_counter.line_orientation = line_orientation
 
         if not st.session_state.live_running:
             if st.button("Start camera", type="primary", key="start_camera"):
@@ -397,6 +601,7 @@ def main():
                             line_position=line_position,
                             imgsz=image_size,
                             debug=debug,
+                            line_orientation=line_orientation,
                         )
                         st.session_state.live_capture = capture
                         st.session_state.live_counter = counter
@@ -456,6 +661,7 @@ def main():
                         line_position=line_position,
                         imgsz=image_size,
                         debug=debug,
+                        line_orientation=line_orientation,
                     )
 
                     def update_progress(done, total):
@@ -474,6 +680,8 @@ def main():
                     st.session_state.video_result_frames = frames
                     st.session_state.video_result_name = uploaded_file.name
                     st.session_state.video_result_upload_id = upload_id
+                    st.session_state.video_result_orientation = line_orientation
+                    st.session_state.video_result_track_ids = set(counter.seen_ids)
                     st.session_state.video_debug_observations = (
                         counter.debug_observations if debug else None
                     )
